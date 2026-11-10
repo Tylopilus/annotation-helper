@@ -1,0 +1,21 @@
+.{
+    .name = .annotation_helper,
+    .version = "0.1.0",
+    .fingerprint = 0x5e0bf79a05cee50c,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .win32 = .{
+            .url = "https://github.com/marlersoft/zigwin32/archive/fb2645891520f3e99931db17a7eba04057e87e89.tar.gz",
+            .hash = "N-V-__8AAM794wNE-RcUyn-Ut_0idPJkkLJeFQjLYVWthWQd",
+        },
+        .stb = .{
+            .url = "https://github.com/nothings/stb/archive/003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5.tar.gz",
+            .hash = "N-V-__8AAO9ETgDfL4wpGK8nkgl4_31egkgaxiDeQ9pS54gj",
+        },
+        .whisper_cpp = .{
+            .url = "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.8.3.tar.gz",
+            .hash = "N-V-__8AAPv4ygG4RZc90zGtqDt2nbBj45Q3ApIrnnOJIxOV",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "csrc" },
+}
