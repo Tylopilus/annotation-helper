@@ -26,6 +26,28 @@ screen through its MCP server.
 
 ## Install
 
+### Quick install (Linux and WSL)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Tylopilus/annotation-helper/main/install.sh | bash
+```
+
+or, from a clone of this repository, `./install.sh`. The installer:
+
+1. downloads Zig 0.17.0 (checksum-verified) unless it is already installed, builds
+   annotation-helper and installs it,
+2. downloads the speech model (181 MB) if there is none yet,
+3. sets up autostart and starts the app,
+4. then asks whether to register the MCP server with the AI agents it finds (Claude Code,
+   Codex, Copilot CLI, Antigravity) and to install the agent skill.
+
+Inside WSL it installs the **Windows** app into `C:\Users\<you>\annotation-helper\`, because
+that is the screen you'll annotate; `--target linux` installs the Linux app instead. Run it
+again any time to update. `./install.sh --help` lists the options (`-y` accepts all
+defaults).
+
+The sections below describe the same steps by hand.
+
 ### Windows
 
 1. Put `annotation-helper.exe` in a folder of its own, e.g. `C:\Users\<you>\annotation-helper\`.
