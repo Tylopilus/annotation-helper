@@ -1,12 +1,13 @@
-//! annotation-helper, Zig 0.17 port: narrate + annotate your screen, hand it to an AI agent.
+//! annotation-helper: narrate + annotate your screen, hand it to an AI agent.
 //! Windows: a GUI-subsystem tray app; CLI modes attach to the parent console.
-//! Linux: `process` and `mcp` only (recording needs the Windows UI).
+//! Linux: a tray app for X11 and Wayland desktops (src/linux/).
 
 const std = @import("std");
 const w = @import("win32").everything;
 const util = @import("util.zig");
 const config = @import("config.zig");
 const app = @import("app.zig");
+const lapp = @import("linux/app.zig");
 const process = @import("process.zig");
 const mcp = @import("mcp.zig");
 const audio = @import("audio.zig");
@@ -28,10 +29,16 @@ const USAGE =
     \\  annotation-helper selftest [--audio-file WAV] [--out DIR] [--lang CODE] [--model FILE]
     \\  annotation-helper mcp [--out DIR] [--lang CODE] [--model FILE]   MCP server on stdio
     \\  annotation-helper mictest                                         check the microphone (records nothing)
+++ (if (util.is_windows) "" else
     \\
-    \\  --out DIR       where sessions are stored (default: 'sessions' next to the exe)
+    \\  annotation-helper draw | toggle | quit    control the running app (bind these to keyboard
+    \\                                            shortcuts if your desktop has no global shortcuts)
+) ++
+    \\
+    \\
+    \\  --out DIR       where sessions are stored (default: 'sessions' in the data folder)
     \\  --lang CODE     speech language, e.g. de, en (default: auto-detect)
-    \\  --model FILE    whisper ggml model (default: first ggml-*.bin in 'models' next to the exe)
+    \\  --model FILE    whisper ggml model (default: first ggml-*.bin in 'models')
     \\
 ;
 
@@ -67,7 +74,7 @@ fn realMain(init: std.process.Init.Minimal) !void {
     const argv = try init.args.toSlice(a);
     var cmd: []const u8 = "record";
     var i: usize = 1;
-    if (argv.len > 1) for ([_][]const u8{ "record", "process", "selftest", "mcp", "mictest", "help" }) |c| {
+    if (argv.len > 1) for ([_][]const u8{ "record", "process", "selftest", "mcp", "mictest", "help", "draw", "toggle", "quit" }) |c| {
         if (std.mem.eql(u8, argv[1], c)) {
             cmd = c;
             i = 2;
@@ -110,10 +117,13 @@ fn realMain(init: std.process.Init.Minimal) !void {
     if (loaded.warning) |warn| util.log("warning: {s}", .{warn});
     const cfg = loaded.config;
 
-    if (std.mem.eql(u8, cmd, "mictest")) {
-        if (comptime util.is_windows) return audio.probe(2000);
-        util.log("mictest needs the Windows build", .{});
-        return error.WindowsOnly;
+    if (std.mem.eql(u8, cmd, "mictest")) return audio.probe(2000);
+    if (std.mem.eql(u8, cmd, "draw") or std.mem.eql(u8, cmd, "toggle") or std.mem.eql(u8, cmd, "quit")) {
+        if (comptime util.is_windows) {
+            util.log("'{s}' is for the Linux build; on Windows use the hotkeys or the tray menu.", .{cmd});
+            return error.LinuxOnly;
+        }
+        return lapp.control(cmd);
     }
     if (std.mem.eql(u8, cmd, "help")) {
         util.log("{s}", .{USAGE});
@@ -128,12 +138,44 @@ fn realMain(init: std.process.Init.Minimal) !void {
     }
 
     const sessions = out orelse try config.sessionsDir(a, cfg);
-    if (comptime !util.is_windows) {
-        if (std.mem.eql(u8, cmd, "mcp")) return mcp.serve(sessions);
-        util.log("'{s}' needs the Windows build; on Linux only `process`, `mcp` and `help` are available.", .{cmd});
-        return error.WindowsOnly;
-    }
+    if (comptime !util.is_windows) return runLinux(a, cmd, sessions, cfg, lang, model_path, audio_file, no_audio, no_process);
     return runWindows(a, cmd, sessions, cfg, lang, model_path, audio_file, no_audio, no_process);
+}
+
+fn runLinux(
+    a: std.mem.Allocator,
+    cmd: []const u8,
+    sessions: []const u8,
+    cfg: config.Config,
+    lang: ?[]const u8,
+    model_path: ?[]const u8,
+    audio_file: ?[]const u8,
+    no_audio: bool,
+    no_process: bool,
+) !void {
+    // The processor reads config.json itself; only forward explicit overrides.
+    var pargs: std.ArrayList([]const u8) = .empty;
+    if (lang) |l| try pargs.appendSlice(a, &.{ "--lang", l });
+    if (model_path) |m| try pargs.appendSlice(a, &.{ "--model", m });
+    const selftest = std.mem.eql(u8, cmd, "selftest");
+    if (selftest) try pargs.append(a, "--no-clipboard");
+    const opts = lapp.Options{
+        .out_dir = sessions,
+        .no_audio = no_audio or selftest,
+        .audio_file = audio_file,
+        .process_args = if (no_process) null else pargs.items,
+        .config = if (std.mem.eql(u8, cmd, "record")) cfg else null,
+    };
+    util.log("annotation-helper 0.1.0", .{});
+    if (selftest) return lapp.selftest(opts);
+    if (std.mem.eql(u8, cmd, "mcp")) {
+        mcp_dir = sessions;
+        // In WSL the screen to annotate is the Windows one: leave that to the Windows exe.
+        const wsl = std.c.getenv("WSL_DISTRO_NAME") != null and std.c.getenv("ANNOTATION_HELPER_LINUX_UI") == null;
+        if (wsl) return mcp.serve(sessions);
+        return lapp.runMcp(opts, serveMcp);
+    }
+    return lapp.run(opts);
 }
 
 fn runWindows(
@@ -177,4 +219,9 @@ fn serveMcp() void {
 test {
     _ = config;
     _ = @import("raster.zig");
+    if (!util.is_windows) {
+        _ = @import("linux/dbus.zig");
+        _ = @import("linux/keys.zig");
+        _ = @import("linux/desktop.zig");
+    }
 }

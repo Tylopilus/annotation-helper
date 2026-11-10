@@ -4,6 +4,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 const model = @import("model.zig");
+const config = @import("config.zig");
 
 extern fn ah_transcribe(
     model_path: [*:0]const u8,
@@ -36,7 +37,7 @@ pub fn run(a: std.mem.Allocator, o: Options) !void {
         if (findModel(a, o.model)) |model_path| {
             transcript = try transcribe(a, try util.join(a, &.{ o.dir, au.file }), au.offset_ms, model_path, o.lang);
             try util.writeFile(try util.join(a, &.{ o.dir, "transcript.json" }), try model.toJson(a, transcript.?));
-        } else util.log("  no whisper model found — put a ggml-*.bin into a 'models' folder next to the exe", .{});
+        } else util.log("  no whisper model found — put a ggml-*.bin into a 'models' folder next to the exe{s}", .{if (util.is_windows) "" else " or in ~/.local/share/annotation-helper/models"});
     }
 
     const brief = try buildBrief(a, session, transcript);
@@ -45,17 +46,28 @@ pub fn run(a: std.mem.Allocator, o: Options) !void {
     const wsl = try util.wslPath(a, brief_path);
     util.log("✔ Brief ready: {s}", .{brief_path});
     if (wsl) |p| util.log("  (WSL: {s})", .{p});
-    if (o.clipboard and util.is_windows) {
+    if (o.clipboard) {
         const where = if (wsl) |p| try a.print("{s} (Windows path: {s})", .{ p, brief_path }) else brief_path;
         const prompt = try a.print("I recorded a narrated screen session with annotations. Read the brief at {s} and look at the screenshots it references (same folder). Then summarize what I'm asking for, list open questions, and propose next steps before changing anything.", .{where});
-        if (util.setClipboard(prompt)) util.log("  Hand-off prompt copied to clipboard — paste it into your agent.", .{}) else |_| {}
+        if (util.setClipboard(prompt)) util.log("  Hand-off prompt copied to clipboard — paste it into your agent.", .{}) else |e| if (!util.is_windows) {
+            util.log("  clipboard: {s} (install wl-clipboard on Wayland or xclip on X11)", .{@errorName(e)});
+        }
     }
 }
 
 fn findModel(a: std.mem.Allocator, explicit: ?[]const u8) ?[]const u8 {
     if (explicit) |p| return if (util.exists(p)) p else null;
-    const dir = util.exeDir(a) catch return null;
-    const models = util.join(a, &.{ dir, "models" }) catch return null;
+    // `models` next to the exe, then (Linux) in the data folder.
+    const exe_dir = util.exeDir(a) catch return null;
+    const data_dir = config.dataDir(a) catch exe_dir;
+    for ([_][]const u8{ exe_dir, data_dir }) |dir| {
+        const models = util.join(a, &.{ dir, "models" }) catch continue;
+        if (findModelIn(a, models)) |m| return m;
+    }
+    return null;
+}
+
+fn findModelIn(a: std.mem.Allocator, models: []const u8) ?[]const u8 {
     const names = util.listDir(a, models, false) catch return null;
     // Prefer bigger (better) models if several are present.
     const ranks = [_][]const u8{ "large", "turbo", "medium", "small", "base", "tiny" };
@@ -203,7 +215,7 @@ pub fn buildBrief(a: std.mem.Allocator, session: model.Session, transcript: ?mod
         try md.print(a, ", speech transcribed offline ({s}, language: {s}).\n\n", .{ t.model, t.language orelse "?" });
     } else try md.appendSlice(a, if (session.audio != null) ", audio recorded but not transcribed.\n\n" else ", no audio.\n\n");
     try md.appendSlice(a,
-        \\**How to read this:** the timeline interleaves what the user *said* (quoted, `[mm:ss]`) with screenshots they annotated while talking. Every annotation carries a numbered badge `#N` in the image. Words like "this", "here" or "that one" usually refer to the annotation drawn at about the same time. Open the referenced PNG files (same folder as this brief) — `frame-NN.png` is the annotated screenshot, `frame-NN-aMM.png` a zoomed crop around annotation #MM, `frame-NN-clean.png` the same screen without drawings. "on/from/to" names the UI element under the annotation as reported by Windows UI Automation; for code editors and canvases it can be generic, so trust the image. Arrows point *from* → *to*, often expressing a relation between two places. Machine-readable details: `session.json`, `transcript.json`. The speech transcript may contain recognition errors — interpret it in context.
+        \\**How to read this:** the timeline interleaves what the user *said* (quoted, `[mm:ss]`) with screenshots they annotated while talking. Every annotation carries a numbered badge `#N` in the image. Words like "this", "here" or "that one" usually refer to the annotation drawn at about the same time. Open the referenced PNG files (same folder as this brief) — `frame-NN.png` is the annotated screenshot, `frame-NN-aMM.png` a zoomed crop around annotation #MM, `frame-NN-clean.png` the same screen without drawings. "on/from/to" names the UI element under the annotation as reported by the system's accessibility interface (UI Automation on Windows, AT-SPI on Linux); for code editors and canvases it can be generic, so trust the image. Arrows point *from* → *to*, often expressing a relation between two places. Machine-readable details: `session.json`, `transcript.json`. The speech transcript may contain recognition errors — interpret it in context.
         \\
         \\## Timeline
         \\

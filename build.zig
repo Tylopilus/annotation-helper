@@ -2,7 +2,7 @@
 //! Compile flags mirror whisper.cpp's CMake build (v1.8.3, CPU backend, AVX2 baseline).
 //!
 //!   zig build --release=safe                                  Windows tray app (default target)
-//!   zig build --release=safe -Dtarget=x86_64-linux-gnu        Linux: `process` and `mcp` only
+//!   zig build --release=safe -Dtarget=x86_64-linux-gnu        Linux tray app (X11 + Wayland)
 //!
 //! ReleaseSafe keeps bounds and overflow checks in the app; whisper.cpp is always ReleaseFast.
 
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.linkLibrary(whisper);
-    if (is_windows) exe.subsystem = .windows;
+    if (is_windows) exe.subsystem = .windows else linkLinux(exe);
     b.installArtifact(exe);
 
     // Unit tests: `zig build test-exe`, then run zig-out/bin/tests(.exe) on the target OS.
@@ -56,7 +56,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.linkLibrary(whisper);
+    if (!is_windows) linkLinux(tests);
     b.step("test-exe", "Build the unit tests").dependOn(&b.addInstallArtifact(tests, .{}).step);
+}
+
+/// miniaudio and xkbcommon are loaded at runtime (dlopen), so only libc's own parts.
+fn linkLinux(c: *std.Build.Step.Compile) void {
+    c.root_module.linkSystemLibrary("dl", .{});
+    c.root_module.linkSystemLibrary("pthread", .{});
+    c.root_module.linkSystemLibrary("m", .{});
 }
 
 const win32_root = "zigwin32-fb2645891520f3e99931db17a7eba04057e87e89/";
@@ -145,18 +153,15 @@ fn buildWhisper(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step
     m.addCSourceFile(.{ .file = b.path("csrc/whisper_shim.c"), .flags = &.{ "-std=c11", "-w" } });
     // miniaudio ships with whisper.cpp (examples/miniaudio.h).
     m.addIncludePath(src.path(whisper_root ++ "examples"));
-    m.addCSourceFile(.{
-        .file = b.path("csrc/audio_shim.c"),
-        // The Linux build never records; it only decodes WAV files.
-        .flags = if (is_windows) &.{ "-std=gnu11", "-w", "-DNDEBUG" } else &.{ "-std=gnu11", "-w", "-DNDEBUG", "-DMA_NO_DEVICE_IO" },
-    });
+    m.addCSourceFile(.{ .file = b.path("csrc/audio_shim.c"), .flags = &.{ "-std=gnu11", "-w", "-DNDEBUG" } });
     if (!is_windows) {
-        // MCP images (WIC does this on Windows). stb_image_resize2 moved to its own
-        // repo; the pinned commit still has it under deprecated/.
+        // PNGs and banner text (WIC and GDI do this on Windows). stb_image_resize2 moved
+        // to its own repo; the pinned commit still has it under deprecated/.
         const stb = b.dependency("stb", .{});
         m.addIncludePath(stb.path(stb_root));
         m.addIncludePath(stb.path(stb_root ++ "deprecated"));
         m.addCSourceFile(.{ .file = b.path("csrc/image_shim.c"), .flags = &.{ "-std=gnu11", "-w", "-DNDEBUG" } });
+        m.addCSourceFile(.{ .file = b.path("csrc/text_shim.c"), .flags = &.{ "-std=gnu11", "-w", "-DNDEBUG" } });
     }
     return lib;
 }

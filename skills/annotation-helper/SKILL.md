@@ -5,7 +5,7 @@ description: See the user's screen and let them point at things, via the annotat
 
 # Working with the user's screen
 
-The `annotation-helper` MCP server connects you to the user's Windows screen. The user records
+The `annotation-helper` MCP server connects you to the user's screen (Windows or Linux). The user records
 **sessions**: they talk while drawing numbered annotations (`#N` boxes, ellipses, arrows,
 highlights) on screenshots of any app. You can also ask them a question **on their screen** and
 get back what they drew and said.
@@ -56,7 +56,9 @@ ask: `annotate_screen` with "Mark anything that still looks wrong, or press Esc 
 
 ## Notes
 
-- `annotate_screen` exists only when the server runs as the Windows app; if the tool is missing,
-  fall back to text questions.
-- Results give paths both as Windows (`C:\...`) and WSL (`/mnt/c/...`) paths; use the one that
+- `annotate_screen` exists only when the server can show its drawing UI (the Windows app, or the
+  Linux app on a desktop with X11 or Wayland); if the tool is missing, fall back to text questions.
+- On Linux, drawing happens on a frozen screenshot; on Wayland the UI element under an
+  annotation is often just the window, so rely on the image.
+- Windows results give paths both as Windows (`C:\...`) and WSL (`/mnt/c/...`) paths; use the one that
   matches your environment if you open files directly.

@@ -1,10 +1,11 @@
 //! Helpers for files, directories, processes, clipboard, time and logging.
-//! Windows uses Win32 directly (thread-safe, independent of std I/O churn); the
-//! Linux build (only `process` and `mcp`) uses std.Io.
+//! Windows uses Win32 directly (thread-safe, independent of std I/O churn); Linux uses
+//! std.Io for files and libc (src/linux/sys.zig) for processes and time.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const w = @import("win32").everything;
+const lsys = @import("linux/sys.zig");
 
 pub const is_windows = builtin.os.tag == .windows;
 
@@ -200,6 +201,16 @@ pub fn freeNames(a: Allocator, names: []const []u8) void {
 pub fn deleteFlatDir(a: Allocator, dir: []const u8) void {
     const names = listDir(a, dir, false) catch return;
     defer freeNames(a, names);
+    if (comptime !is_windows) {
+        var zb: [4096]u8 = undefined;
+        for (names) |n| {
+            const p = std.fmt.bufPrintSentinel(&zb, "{s}/{s}", .{ dir, n }, 0) catch continue;
+            _ = lsys.unlink(p.ptr);
+        }
+        const d = std.fmt.bufPrintSentinel(&zb, "{s}", .{dir}, 0) catch return;
+        _ = lsys.rmdir(d.ptr);
+        return;
+    }
     var buf: [1024]u16 = undefined;
     for (names) |n| {
         const p = std.fs.path.join(a, &.{ dir, n }) catch continue;
@@ -221,6 +232,14 @@ pub fn exeDir(a: Allocator) ![]u8 {
     const path = try narrow(a, buf[0..n]);
     defer a.free(path);
     return a.dupe(u8, std.fs.path.dirnameWindows(path) orelse ".");
+}
+
+/// Full path of the running executable (Linux).
+pub fn exePath(a: Allocator) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    const n = lsys.readlink("/proc/self/exe", &buf, buf.len);
+    if (n <= 0) return error.NoExePath;
+    return a.dupe(u8, buf[0..@intCast(n)]);
 }
 
 pub fn exePathW(buf: *[1024]u16) [:0]u16 {
@@ -286,7 +305,7 @@ pub fn windowInfo(a: Allocator, hwnd: ?w.HWND) ?WindowInfo {
 // ------------------------------------------------------------------ misc
 
 pub fn setClipboard(text: []const u8) !void {
-    if (comptime !is_windows) return error.Unsupported;
+    if (comptime !is_windows) return setClipboardLinux(text);
     const w16 = try wide(gpa, text);
     defer gpa.free(w16);
     if (w.OpenClipboard(null) == 0) return error.Clipboard;
@@ -301,10 +320,54 @@ pub fn setClipboard(text: []const u8) !void {
     if (w.SetClipboardData(@intFromEnum(w.CF_UNICODETEXT), @ptrFromInt(@as(usize, @bitCast(mem)))) == null) return error.Clipboard;
 }
 
+/// Linux: hands the text to wl-copy (Wayland), xclip or xsel (X11); the clipboard
+/// needs a process that stays around, and these tools do that.
+fn setClipboardLinux(text: []const u8) !void {
+    const wayland = lsys.env("WAYLAND_DISPLAY") != null;
+    const tools = [_]struct { wl: bool, argv: []const []const u8 }{
+        .{ .wl = true, .argv = &.{"wl-copy"} },
+        .{ .wl = false, .argv = &.{ "xclip", "-selection", "clipboard" } },
+        .{ .wl = false, .argv = &.{ "xsel", "--clipboard", "--input" } },
+    };
+    for (tools) |t| {
+        if (t.wl != wayland and !(t.wl == false and lsys.env("DISPLAY") != null)) continue;
+        if (!lsys.inPath(t.argv[0])) continue;
+        var fds: [2]c_int = undefined;
+        if (lsys.pipe2(&fds, lsys.O_CLOEXEC) != 0) return error.Clipboard;
+        const pid = lsys.spawn(gpa, t.argv, .{ .stdin_fd = fds[0] }) catch {
+            _ = lsys.close(fds[0]);
+            _ = lsys.close(fds[1]);
+            continue;
+        };
+        _ = lsys.close(fds[0]);
+        var off: usize = 0;
+        while (off < text.len) {
+            const n = lsys.write(fds[1], text[off..].ptr, text.len - off);
+            if (n <= 0) break;
+            off += @intCast(n);
+        }
+        _ = lsys.close(fds[1]);
+        if (lsys.wait(pid) == 0) return;
+    }
+    return error.NoClipboardTool;
+}
+
 pub const Timestamp = struct { id: [19]u8, human: [19]u8 };
 
 /// ("2026-10-28_14-03-12", "2026-10-28 14:03:12")
 pub fn localTimestamp() Timestamp {
+    if (comptime !is_windows) {
+        const now = lsys.time(null);
+        var tm: lsys.Tm = undefined;
+        _ = lsys.localtime_r(&now, &tm);
+        const y: u32 = @intCast(tm.year + 1900);
+        const mo: u32 = @intCast(tm.mon + 1);
+        const v = [_]u32{ @intCast(tm.mday), @intCast(tm.hour), @intCast(tm.min), @intCast(tm.sec) };
+        var r: Timestamp = undefined;
+        _ = std.fmt.bufPrint(&r.id, "{d:0>4}-{d:0>2}-{d:0>2}_{d:0>2}-{d:0>2}-{d:0>2}", .{ y, mo, v[0], v[1], v[2], v[3] }) catch unreachable;
+        _ = std.fmt.bufPrint(&r.human, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ y, mo, v[0], v[1], v[2], v[3] }) catch unreachable;
+        return r;
+    }
     var t: w.SYSTEMTIME = undefined;
     w.GetLocalTime(&t);
     var r: Timestamp = undefined;

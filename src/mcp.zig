@@ -9,6 +9,8 @@ const com = @import("com.zig");
 const process = @import("process.zig");
 const app = @import("app.zig");
 const worker = @import("worker.zig");
+const lapp = @import("linux/app.zig");
+const lworker = @import("linux/worker.zig");
 
 const Value = std.json.Value;
 const MAX_EDGE: u32 = 1568;
@@ -38,12 +40,17 @@ const TOOLS_COMMON =
     \\{"name":"get_image","title":"Get a session image","description":"Get one image file of a session, e.g. a clean screenshot (frame-NN-clean.png) or a frame at higher resolution.","inputSchema":{"type":"object","required":["file"],"properties":{"session_id":{"type":"string","description":"Default: latest session."},"file":{"type":"string","description":"File name inside the session folder, e.g. frame-01.png"},"max_edge":{"type":"integer","minimum":200,"maximum":4000,"description":"Downscale so the longest edge fits (default 1568)."}}},"annotations":{"readOnlyHint":true}},
 ;
 
-/// Windows only: needs the drawing UI.
+/// Needs the drawing UI (Windows, or Linux with a display).
 const TOOL_ANNOTATE =
     \\{"name":"annotate_screen","title":"Ask the user to annotate their screen","description":"Show a question on the user's screen and let them answer by drawing on it (boxes, arrows, circles, highlights) and, by default, talking. Blocks until they press Esc, then returns the annotated screenshot, a zoomed crop and the UI element under each annotation, plus what they said. Use it to resolve ambiguity about something visible: \"Which button do you mean?\", \"Circle the misaligned element\", \"Point from the field to where its value should come from\". The user can cancel (an error result).","inputSchema":{"type":"object","required":["prompt"],"properties":{"prompt":{"type":"string","description":"Short question shown to the user, e.g. 'Which of these buttons should be disabled?'"},"voice":{"type":"boolean","description":"Record and transcribe what the user says while drawing (default true)."},"timeout_s":{"type":"integer","minimum":10,"maximum":3600,"description":"Give up after this many seconds (default 600)."}}}}
 ;
 
-const TOOLS = if (util.is_windows) TOOLS_COMMON ++ TOOL_ANNOTATE ++ "]" else TOOLS_COMMON[0 .. TOOLS_COMMON.len - 1] ++ "]";
+const TOOLS_ALL = TOOLS_COMMON ++ TOOL_ANNOTATE ++ "]";
+const TOOLS_READ_ONLY = TOOLS_COMMON[0 .. TOOLS_COMMON.len - 1] ++ "]";
+
+fn canAnnotate() bool {
+    return util.is_windows or lapp.canAnnotate();
+}
 
 const Content = struct {
     type: []const u8,
@@ -143,7 +150,7 @@ fn handleLine(line: []u8) void {
         if (std.mem.eql(u8, method, "notifications/cancelled")) {
             const target = if (params == .object) params.object.get("requestId") else null;
             if (target != null and target.? == .integer and annotating_id != null and annotating_id.? == target.?.integer) {
-                if (comptime util.is_windows) app.cancelAnnotation();
+                if (comptime util.is_windows) app.cancelAnnotation() else lapp.cancelAnnotation();
             }
         }
         return;
@@ -166,7 +173,7 @@ fn handleLine(line: []u8) void {
         reply(a, id.?, "{}");
     } else if (std.mem.eql(u8, method, "tools/list")) {
         // Multi-line literals contain '\n'; JSON-RPC over stdio is one message per line.
-        const tools = std.mem.replaceOwned(u8, a, TOOLS, "\n", "") catch return;
+        const tools = std.mem.replaceOwned(u8, a, if (canAnnotate()) TOOLS_ALL else TOOLS_READ_ONLY, "\n", "") catch return;
         reply(a, id.?, a.print("{{\"tools\":{s}}}", .{tools}) catch return);
     } else {
         replyError(a, id.?, -32601, a.print("method not found: {s}", .{method}) catch "method not found");
@@ -233,23 +240,33 @@ fn callTool(a: std.mem.Allocator, id: Value, params: Value) []const u8 {
         const img = imageBlock(a, path, @intCast(std.math.clamp(argInt(args, "max_edge", MAX_EDGE), 200, 4000))) orelse return toolError(a, a.print("cannot read {s}", .{file}) catch "cannot read image");
         return toolJson(a, .{ .content = &.{ .{ .type = "text", .text = file }, img } });
     } else if (std.mem.eql(u8, name, "annotate_screen")) {
-        return if (comptime util.is_windows) annotateScreen(a, id, args) else toolError(a, "annotate_screen needs the Windows build (it shows the drawing UI).");
+        if (!canAnnotate()) return toolError(a, "annotate_screen needs a screen to draw on (Windows, or Linux with X11/Wayland).");
+        return annotateScreen(a, id, args);
     }
     return toolError(a, a.print("unknown tool '{s}'", .{name}) catch "unknown tool");
 }
 
-/// Windows only: show the request banner, wait for the user's drawing, return it.
+/// Show the request banner, wait for the user's drawing, return it.
 fn annotateScreen(a: std.mem.Allocator, id: Value, args: ?Value) []const u8 {
     const prompt = std.mem.trim(u8, argStr(args, "prompt") orelse "", " ");
     if (prompt.len == 0) return toolError(a, "prompt must not be empty");
     const voice = if (args) |o| (if (o == .object) (if (o.object.get("voice")) |v| (if (v == .bool) v.bool else true) else true) else true) else true;
     const timeout_s = std.math.clamp(argInt(args, "timeout_s", 600), 10, 3600);
-    var r = worker.Reply{ .event = w.CreateEventW(null, w.TRUE, w.FALSE, null) orelse return toolError(a, "no event") };
-    defer _ = w.CloseHandle(r.event);
-    var req = app.Request{ .prompt = prompt, .asker = client_name[0..client_len], .voice = voice, .timeout_ms = @intCast(timeout_s * 1000), .reply = &r };
     annotating_id = if (id == .integer) id.integer else null;
-    app.annotate(&req);
+    const res = if (comptime util.is_windows) blk: {
+        var r = worker.Reply{ .event = w.CreateEventW(null, w.TRUE, w.FALSE, null) orelse return toolError(a, "no event") };
+        defer _ = w.CloseHandle(r.event);
+        var req = app.Request{ .prompt = prompt, .asker = client_name[0..client_len], .voice = voice, .timeout_ms = @intCast(timeout_s * 1000), .reply = &r };
+        app.annotate(&req);
+        break :blk .{ r.ok, r.text };
+    } else blk: {
+        var r = lworker.Reply{};
+        var req = lapp.Request{ .prompt = prompt, .asker = client_name[0..client_len], .voice = voice, .timeout_ms = @intCast(timeout_s * 1000), .reply = &r };
+        lapp.annotate(&req);
+        break :blk .{ r.ok, r.text };
+    };
     annotating_id = null;
+    const r = .{ .ok = res[0], .text = res[1] };
     defer util.gpa.free(r.text);
     if (!r.ok) return toolError(a, a.print("No annotation: {s}.", .{r.text}) catch "No annotation.");
     const intro = a.print("The user answered your request \"{s}\" by annotating their screen.", .{prompt}) catch "";

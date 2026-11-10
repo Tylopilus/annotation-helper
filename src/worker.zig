@@ -284,7 +284,7 @@ fn finishFrame(st: *State, a: std.mem.Allocator, job: FrameJob) !void {
 }
 
 /// Crop around an annotation with enough surrounding context; shifted inside the image.
-fn cropRect(b: model.Rect, image: model.Rect) model.Rect {
+pub fn cropRect(b: model.Rect, image: model.Rect) model.Rect {
     const pad = 60;
     const cw = @min(@max(b.w + 2 * pad, 720), image.w);
     const ch = @min(@max(b.h + 2 * pad, 450), image.h);

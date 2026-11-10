@@ -1,4 +1,6 @@
-//! `config.json` next to the exe and hotkey parsing.
+//! `config.json` and hotkey parsing. Windows keeps everything next to the exe. Linux
+//! does too when a config.json sits next to the exe (portable); otherwise it uses
+//! ~/.config/annotation-helper/ and ~/.local/share/annotation-helper/.
 
 const std = @import("std");
 const util = @import("util.zig");
@@ -18,7 +20,33 @@ pub const Config = struct {
 pub fn path(a: std.mem.Allocator) ![]u8 {
     const dir = try util.exeDir(a);
     defer a.free(dir);
-    return util.join(a, &.{ dir, "config.json" });
+    const beside = try util.join(a, &.{ dir, "config.json" });
+    if (util.is_windows or util.exists(beside)) return beside;
+    a.free(beside);
+    const base = try xdgDir(a, "XDG_CONFIG_HOME", ".config");
+    defer a.free(base);
+    return util.join(a, &.{ base, "annotation-helper", "config.json" });
+}
+
+/// Linux data folder for sessions and models (~/.local/share/annotation-helper),
+/// or the exe's folder in portable mode.
+pub fn dataDir(a: std.mem.Allocator) ![]u8 {
+    const dir = try util.exeDir(a);
+    if (util.is_windows) return dir;
+    const beside = try util.join(a, &.{ dir, "config.json" });
+    defer a.free(beside);
+    if (util.exists(beside)) return dir;
+    a.free(dir);
+    const base = try xdgDir(a, "XDG_DATA_HOME", ".local/share");
+    defer a.free(base);
+    return util.join(a, &.{ base, "annotation-helper" });
+}
+
+fn xdgDir(a: std.mem.Allocator, comptime env: [:0]const u8, comptime fallback: []const u8) ![]u8 {
+    const sys = @import("linux/sys.zig");
+    if (sys.env(env)) |v| if (v[0] == '/') return a.dupe(u8, v);
+    const home = sys.env("HOME") orelse return error.NoHome;
+    return util.join(a, &.{ home, fallback });
 }
 
 /// Loaded config; strings live in `arena` until the process ends.
@@ -36,12 +64,13 @@ pub fn save(c: Config) !void {
     defer a.free(p);
     const json = try std.json.Stringify.valueAlloc(a, c, .{ .whitespace = .indent_2 });
     defer a.free(json);
+    if (std.fs.path.dirname(p)) |d| if (!util.is_windows) util.mkdirAll(d) catch {};
     try util.writeFile(p, json);
 }
 
 pub fn sessionsDir(a: std.mem.Allocator, c: Config) ![]u8 {
     if (c.sessions_dir) |d| return a.dupe(u8, d);
-    const dir = try util.exeDir(a);
+    const dir = try dataDir(a);
     defer a.free(dir);
     return util.join(a, &.{ dir, "sessions" });
 }

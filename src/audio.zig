@@ -3,7 +3,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 
-extern fn ah_audio_start(path: [*:0]const u16, rate: u32) c_int;
+extern fn ah_audio_start(path: if (util.is_windows) [*:0]const u16 else [*:0]const u8, rate: u32) c_int;
 extern fn ah_audio_stop() i64;
 extern fn ah_audio_device_name() [*:0]const u8;
 extern fn ah_audio_error() [*:0]const u8;
@@ -20,7 +20,9 @@ pub const Recorder = struct {
     /// Starts recording the default microphone into `path`.
     pub fn start(path: []const u8) !*Recorder {
         var buf: [1024]u16 = undefined;
-        if (ah_audio_start(util.wideInto(&buf, path), sample_rate) != 0) {
+        var buf8: [4096]u8 = undefined;
+        const p = if (comptime util.is_windows) util.wideInto(&buf, path) else std.fmt.bufPrintSentinel(&buf8, "{s}", .{path}, 0) catch return error.NameTooLong;
+        if (ah_audio_start(p.ptr, sample_rate) != 0) {
             util.log("  no audio: {s}", .{std.mem.span(ah_audio_error())});
             return error.NoMicrophone;
         }

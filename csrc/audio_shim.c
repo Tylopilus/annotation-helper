@@ -1,10 +1,15 @@
 // Microphone capture and WAV decoding via miniaudio (bundled with whisper.cpp).
 // miniaudio converts and resamples, so we record straight to 16 kHz mono 16-bit,
-// which is what whisper wants. Windows: WASAPI only. Linux build: decoding only
-// (MA_NO_DEVICE_IO is set by build.zig), as it never records.
+// which is what whisper wants. Windows: WASAPI. Linux: PulseAudio (also PipeWire's
+// pulse server) or ALSA, loaded at runtime.
 #define MINIAUDIO_IMPLEMENTATION
 #define MA_ENABLE_ONLY_SPECIFIC_BACKENDS
+#ifdef _WIN32
 #define MA_ENABLE_WASAPI
+#else
+#define MA_ENABLE_PULSEAUDIO
+#define MA_ENABLE_ALSA
+#endif
 #define MA_NO_GENERATION
 #define MA_NO_ENGINE
 #define MA_NO_NODE_GRAPH
@@ -16,7 +21,12 @@
 #include "miniaudio.h"
 
 #ifndef MA_NO_DEVICE_IO
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <time.h>
+#include <unistd.h>
+#endif
 
 static ma_device g_dev;
 static ma_encoder g_enc;
@@ -27,10 +37,16 @@ static const char *g_error = "";
 
 // Same clock as util.nowMs() on the Zig side.
 static int64_t now_ms(void) {
+#ifdef _WIN32
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (int64_t)((c.QuadPart * 1000) / f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
 }
 
 static void on_capture(ma_device *dev, void *out, const void *in, ma_uint32 frames) {
@@ -48,12 +64,21 @@ static ma_device_config capture_config(ma_device_data_proc cb, ma_uint32 rate) {
     return cfg;
 }
 
-// Starts recording the default microphone into `path`. Returns 0 on success.
+// Starts recording the default microphone into `path` (UTF-16 on Windows, UTF-8
+// elsewhere). Returns 0 on success.
+#ifdef _WIN32
 int ah_audio_start(const wchar_t *path, uint32_t rate) {
+#else
+int ah_audio_start(const char *path, uint32_t rate) {
+#endif
     if (g_running) return 1;
     g_first_ms = 0;
     ma_encoder_config ecfg = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, rate);
+#ifdef _WIN32
     ma_result r = ma_encoder_init_file_w(path, &ecfg, &g_enc);
+#else
+    ma_result r = ma_encoder_init_file(path, &ecfg, &g_enc);
+#endif
     if (r != MA_SUCCESS) { g_error = ma_result_description(r); return 2; }
     ma_device_config cfg = capture_config(on_capture, rate);
     r = ma_device_init(NULL, &cfg, &g_dev);
@@ -105,7 +130,11 @@ int ah_audio_probe(uint32_t ms, uint64_t *frames, int *peak, char *name, int nam
     ma_device_get_name(&dev, ma_device_type_capture, name, (size_t)name_len, NULL);
     r = ma_device_start(&dev);
     if (r != MA_SUCCESS) { g_error = ma_result_description(r); ma_device_uninit(&dev); return 2; }
+#ifdef _WIN32
     Sleep(ms);
+#else
+    usleep(ms * 1000);
+#endif
     ma_device_uninit(&dev);
     *frames = g_probe_frames;
     *peak = g_probe_peak;
