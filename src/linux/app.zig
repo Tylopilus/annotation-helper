@@ -237,7 +237,7 @@ fn isWayland() bool {
 
 // ------------------------------------------------------------------ session
 
-fn startSession(with_audio: bool) !void {
+fn startSession(with_audio: bool, for_request: bool) !void {
     if (app.session != null) return;
     const ts = util.localTimestamp();
     const dir = try util.join(util.gpa, &.{ app.opts.out_dir, &ts.id });
@@ -252,9 +252,18 @@ fn startSession(with_audio: bool) !void {
     const arena = try worker.newArena();
     const a = arena.allocator();
     const mons = monitors();
+    // Transcribe while recording, so the brief is ready right after the session ends.
+    var live_args: ?[]const []const u8 = null;
+    if (active.recorder != null) if (app.opts.process_args) |pa| {
+        const list = try a.alloc([]const u8, pa.len + 1);
+        @memcpy(list[0..pa.len], pa);
+        list[pa.len] = "--no-clipboard";
+        live_args = if (for_request) list else list[0..pa.len];
+    };
     sendJobWith(arena, .{ .begin = .{
         .session = .{ .id = try a.dupe(u8, &ts.id), .started_local = try a.dupe(u8, &ts.human), .monitors = try a.dupe(model.Monitor, mons.slice()) },
         .dir = try a.dupe(u8, dir),
+        .live_args = live_args,
     } });
     app.session = active;
     updateTray();
@@ -335,7 +344,7 @@ fn screenshot() !Shot {
 
 fn startDraw() !void {
     const disp = app.disp orelse return error.NoDisplay;
-    try startSession(true);
+    try startSession(true, false);
     var fg_arena = std.heap.ArenaAllocator.init(util.gpa);
     errdefer fg_arena.deinit();
     var fg: ?model.WindowInfo = null;
@@ -672,7 +681,7 @@ fn setColor(c: model.ColorName) void {
 fn onHotkey(slot: usize) void {
     if (app.request != null or app.capturing != null) return;
     switch (slot) {
-        0 => if (app.session != null) stopSession(false, null) else startSession(true) catch |e| util.log("  error: {s}", .{@errorName(e)}),
+        0 => if (app.session != null) stopSession(false, null) else startSession(true, false) catch |e| util.log("  error: {s}", .{@errorName(e)}),
         1 => if (app.draw != null) finishDraw() else startDraw() catch |e| util.log("  error: {s}", .{@errorName(e)}),
         else => {},
     }
@@ -874,7 +883,7 @@ fn beginRequests() void {
             replyErr(req.reply, "no display to draw on (annotation-helper needs X11 or Wayland)");
             continue;
         }
-        startSession(req.voice) catch {
+        startSession(req.voice, true) catch {
             replyErr(req.reply, "could not start a session");
             continue;
         };

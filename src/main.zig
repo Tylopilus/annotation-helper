@@ -87,6 +87,7 @@ fn realMain(init: std.process.Init.Minimal) !void {
     var no_audio = false;
     var no_process = false;
     var no_clipboard = false;
+    var live = false; // process: follow a recording in progress (started by the app)
     var positional: std.ArrayList([]const u8) = .empty;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
@@ -105,6 +106,8 @@ fn realMain(init: std.process.Init.Minimal) !void {
             no_process = true;
         } else if (std.mem.eql(u8, arg, "--no-clipboard")) {
             no_clipboard = true;
+        } else if (std.mem.eql(u8, arg, "--live")) {
+            live = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             cmd = "help";
         } else if (std.mem.startsWith(u8, arg, "--")) {
@@ -134,7 +137,7 @@ fn realMain(init: std.process.Init.Minimal) !void {
             util.log("process needs a session dir\n\n{s}", .{USAGE});
             return error.BadArgs;
         }
-        return process.run(a, .{ .dir = positional.items[0], .lang = lang orelse cfg.language, .model = model_path orelse cfg.model, .clipboard = !no_clipboard });
+        return process.run(a, .{ .dir = positional.items[0], .lang = lang orelse cfg.language, .model = model_path orelse cfg.model, .clipboard = !no_clipboard, .live = live });
     }
 
     const sessions = out orelse try config.sessionsDir(a, cfg);

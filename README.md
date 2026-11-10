@@ -128,8 +128,8 @@ While drawing:
 
 Every annotation gets a numbered badge (`#1`, `#2`, …) so you and the agent can refer to it.
 A session can hold many screenshots: draw, finish, carry on working while you keep talking,
-draw again. When you stop the session, it is transcribed in the background. A notification
-tells you when `brief.md` is ready, and a hand-off prompt pointing at it is on the clipboard,
+draw again. Your speech is transcribed in the background while you talk, so when you stop the session,
+`brief.md` is ready a few seconds later. A notification tells you when it is ready, and a hand-off prompt pointing at it is on the clipboard,
 ready to paste into Claude Code or any other agent. Click the notification to show the files.
 
 ### What a session contains
@@ -324,9 +324,14 @@ skills/              the agent skill
   dirty rectangles, so drawing stays smooth at any screen size.
 - **Audio:** miniaudio (part of whisper.cpp) records straight to a 16 kHz mono WAV, the format
   whisper wants.
-- **Transcription:** after a session, the app starts itself again as `process`, so whisper's
-  memory is returned to the system as soon as it finishes. Speech segments that fall into
-  silence are dropped, which filters out whisper's occasional invented text.
+- **Transcription while you talk:** when a session starts, the app starts itself again as
+  `process --live`. That helper loads the model once, follows `audio.wav` as it grows and
+  transcribes up to each pause (chunks of 10–28 s, each with the previous text as context),
+  using half the CPU cores. When the session ends, only the last stretch is left, so the
+  brief is ready seconds later however long you talked (a 40 s recording: 6 s instead of
+  18 s). The model's memory stays in that helper and is returned when it exits. If the helper
+  fails, the whole recording is transcribed after the session instead. Speech segments that
+  fall into silence are dropped, which filters out whisper's occasional invented text.
 - **MCP:** newline-delimited JSON-RPC over stdio; each tool call runs on its own thread, so
   `annotate_screen` can wait for you without blocking other requests.
 
@@ -361,3 +366,10 @@ skills/              the agent skill
   by bounds as fallback (some toolkits answer point queries wrongly), plus the text line under
   the point.
 - **Microphone:** PulseAudio (also PipeWire's PulseAudio server) or ALSA, loaded at runtime.
+
+## License
+
+annotation-helper is released under the [MIT License](LICENSE). The executables include
+whisper.cpp, miniaudio, stb, zigwin32 and the Zig standard library, all under MIT or
+public-domain licenses; their notices are in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
+and must be passed on with copies of the executables.

@@ -279,6 +279,64 @@ pub fn runProcess(a: Allocator, cmdline: []const u8, log_path: []const u8) !u32 
     return code;
 }
 
+/// A child process whose stdin we hold (Windows), e.g. live transcription.
+pub const PipedProcess = struct {
+    process: w.HANDLE,
+    stdin: w.HANDLE,
+
+    /// Closes the child's stdin and waits for it; returns its exit code.
+    pub fn finish(p: PipedProcess) u32 {
+        _ = w.CloseHandle(p.stdin);
+        _ = w.WaitForSingleObject(p.process, w.INFINITE);
+        var code: u32 = 1;
+        _ = w.GetExitCodeProcess(p.process, &code);
+        _ = w.CloseHandle(p.process);
+        return code;
+    }
+
+    /// Tells the child to stop without output, then waits (at most 30 s).
+    pub fn cancel(p: PipedProcess) void {
+        var n: u32 = 0;
+        _ = w.WriteFile(p.stdin, "cancel\n", 7, &n, null);
+        _ = w.CloseHandle(p.stdin);
+        if (w.WaitForSingleObject(p.process, 30_000) != .NO_ERROR) _ = w.TerminateProcess(p.process, 1);
+        _ = w.CloseHandle(p.process);
+    }
+};
+
+/// Starts `cmdline` (args already quoted) with stdin from a pipe we keep and output to `log_path`.
+pub fn spawnPiped(a: Allocator, cmdline: []const u8, log_path: []const u8) !PipedProcess {
+    var sa = w.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(w.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = w.TRUE };
+    var rd: ?w.HANDLE = null;
+    var wr: ?w.HANDLE = null;
+    if (w.CreatePipe(&rd, &wr, &sa, 0) == 0) return error.PipeFailed;
+    // Only the read end is inherited; our end must not leak into the child.
+    _ = w.SetHandleInformation(wr, @bitCast(w.HANDLE_FLAG_INHERIT), .{});
+    defer _ = w.CloseHandle(rd);
+    var pbuf: [1024]u16 = undefined;
+    const logh = w.CreateFileW(wideInto(&pbuf, log_path), w.FILE_GENERIC_WRITE, .{ .READ = 1 }, &sa, w.CREATE_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null);
+    if (logh == w.INVALID_HANDLE_VALUE) {
+        _ = w.CloseHandle(wr);
+        return error.LogFile;
+    }
+    defer _ = w.CloseHandle(logh);
+    var si = std.mem.zeroes(w.STARTUPINFOW);
+    si.cb = @sizeOf(w.STARTUPINFOW);
+    si.dwFlags = w.STARTF_USESTDHANDLES;
+    si.hStdInput = rd;
+    si.hStdOutput = logh;
+    si.hStdError = logh;
+    var pi: w.PROCESS_INFORMATION = undefined;
+    const cmd = try wide(a, cmdline);
+    defer a.free(cmd);
+    if (w.CreateProcessW(null, cmd.ptr, null, null, w.TRUE, .{ .CREATE_NO_WINDOW = 1 }, null, null, &si, &pi) == 0) {
+        _ = w.CloseHandle(wr);
+        return error.SpawnFailed;
+    }
+    _ = w.CloseHandle(pi.hThread);
+    return .{ .process = pi.hProcess.?, .stdin = wr.? };
+}
+
 pub fn processName(a: Allocator, pid: u32) []u8 {
     const h = w.OpenProcess(w.PROCESS_QUERY_LIMITED_INFORMATION, w.FALSE, pid) orelse return a.dupe(u8, "") catch &.{};
     defer _ = w.CloseHandle(h);

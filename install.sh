@@ -121,8 +121,10 @@ if [ "$TARGET" = windows ]; then
   if [ -z "$WIN_DIR" ]; then
     profile=$(win_profile || true)
     if [ -z "$profile" ]; then
-      # No interop: guess the only real user folder, or ask.
-      mapfile -t users < <(find /mnt/c/Users -mindepth 1 -maxdepth 1 -type d ! -name 'All Users' ! -name Default ! -name 'Default User' ! -name Public 2>/dev/null)
+      # No interop: guess the only personal user folder (not Windows' own or admin accounts
+      # we can't write to), or ask for it.
+      mapfile -t users < <(find /mnt/c/Users -mindepth 1 -maxdepth 1 -type d -writable \
+        ! -name 'All Users' ! -name 'Default*' ! -name 'defaultuser*' ! -name Public ! -name 'adm-*' ! -name 'admin*' 2>/dev/null)
       [ "${#users[@]}" = 1 ] && profile=${users[0]}
     fi
     [ -n "$profile" ] || die "couldn't find your Windows user folder; pass --windows-dir /mnt/c/Users/<you>/annotation-helper"
@@ -218,6 +220,11 @@ else
   case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not on your PATH; add it to run 'annotation-helper' by name" ;; esac
 fi
 ok "$EXE"
+# The license notices travel with the executable.
+NOTICE_DIR=$INSTALL_DIR
+[ "$TARGET" = linux ] && NOTICE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/annotation-helper"
+mkdir -p "$NOTICE_DIR"
+cp "$SRC/LICENSE" "$SRC/THIRD_PARTY_LICENSES.md" "$NOTICE_DIR/" 2>/dev/null || warn "couldn't copy the license files to $NOTICE_DIR"
 
 # ------------------------------------------------------------------ step 1: model
 

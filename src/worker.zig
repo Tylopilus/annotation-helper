@@ -41,7 +41,8 @@ pub const EndJob = struct {
 
 pub const Kind = union(enum) {
     warmup: []const [2]i32,
-    begin: struct { session: model.Session, dir: []const u8 },
+    /// `live_args`: start live transcription with these extra `process` arguments (quoted).
+    begin: struct { session: model.Session, dir: []const u8, live_args: ?[]const u8 = null },
     frame: FrameJob,
     end: EndJob,
     discard,
@@ -91,6 +92,8 @@ pub const Worker = struct {
 };
 
 const State = struct {
+    /// The `process --live` helper of the current session.
+    live: ?util.PipedProcess = null,
     uia: ?com.Uia = null,
     wic: ?com.Wic = null,
     session: ?model.Session = null,
@@ -154,6 +157,7 @@ fn handle(st: *State, job: *Job) void {
             st.dir = b.dir;
             util.mkdirAll(b.dir) catch {};
             st.save();
+            if (b.live_args) |args| st.live = startLive(b.dir, args);
         },
         .frame => |f| {
             st.arenas.append(util.gpa, job.arena) catch {};
@@ -169,13 +173,16 @@ fn handle(st: *State, job: *Job) void {
             st.save();
             const dir = util.gpa.dupe(u8, st.dir) catch return;
             const args = if (e.process_args) |p| util.gpa.dupe(u8, p) catch null else null;
-            const ctx = Finish{ .dir = dir, .args = args, .run_processor = e.process_args != null and st.session != null, .reply = e.reply, .notify = e.notify_hwnd };
+            const ctx = Finish{ .dir = dir, .args = args, .run_processor = e.process_args != null and st.session != null, .reply = e.reply, .notify = e.notify_hwnd, .live = st.live };
+            st.live = null;
             st.reset();
             freeArena(job.arena);
             // Transcription can take a while; don't hold up the next session.
             if (e.wait) ctx.go() else if (std.Thread.spawn(util.thread_cfg, Finish.go, .{ctx})) |t| t.detach() else |_| ctx.go();
         },
         .discard => {
+            if (st.live) |l| l.cancel();
+            st.live = null;
             if (st.dir.len > 0) util.deleteFlatDir(util.gpa, st.dir);
             st.reset();
             freeArena(job.arena);
@@ -190,11 +197,18 @@ const Finish = struct {
     run_processor: bool,
     reply: ?*Reply,
     notify: ?w.HWND,
+    live: ?util.PipedProcess = null,
 
     fn go(f: Finish) void {
         var ok = true;
         var text: []u8 = f.dir;
-        if (f.run_processor) {
+        var done_live = false;
+        if (f.live) |l| {
+            const code = l.finish();
+            done_live = code == 0;
+            if (!done_live) util.log("  live transcription failed (exit code {d}); transcribing again", .{code});
+        }
+        if (f.run_processor and !done_live) {
             if (runProcessor(f.dir, f.args orelse "")) |err| {
                 ok = false;
                 text = err;
@@ -213,6 +227,19 @@ const Finish = struct {
         } else util.gpa.free(text);
     }
 };
+
+/// Starts `<exe> process <dir> --live <args>` with output in process.log; null on failure
+/// (the session is then transcribed when it ends).
+fn startLive(dir: []const u8, args: []const u8) ?util.PipedProcess {
+    var exe_buf: [1024]u16 = undefined;
+    const exe = util.narrow(util.gpa, util.exePathW(&exe_buf)) catch return null;
+    defer util.gpa.free(exe);
+    const cmd = util.gpa.print("\"{s}\" process \"{s}\" --live {s}", .{ exe, dir, args }) catch return null;
+    defer util.gpa.free(cmd);
+    const log_path = util.join(util.gpa, &.{ dir, "process.log" }) catch return null;
+    defer util.gpa.free(log_path);
+    return util.spawnPiped(util.gpa, cmd, log_path) catch null;
+}
 
 /// Runs `<exe> process <dir> <args>` with output in process.log. Returns an error
 /// message (gpa-owned) or null on success.

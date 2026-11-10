@@ -1,35 +1,39 @@
 //! Post-processing of a session: offline transcription (whisper.cpp via csrc/whisper_shim.c)
 //! and `brief.md`, which interleaves narration with annotated screenshots for an AI agent.
+//!
+//! Two modes: `process <dir>` transcribes a finished recording in one go; `process <dir>
+//! --live` is started with the recording, follows audio.wav while it grows, transcribes
+//! at each pause, and finishes when its stdin closes (the session ended), so only the last
+//! few seconds are left to do then.
 
 const std = @import("std");
 const util = @import("util.zig");
 const model = @import("model.zig");
 const config = @import("config.zig");
+const w = @import("win32").everything;
+const lsys = @import("linux/sys.zig");
 
-extern fn ah_transcribe(
-    model_path: [*:0]const u8,
-    pcm: [*]const f32,
-    n_samples: c_int,
-    language: ?[*:0]const u8,
-    n_threads: c_int,
-    cb: *const fn (?*anyopaque, i64, i64, [*:0]const u8) callconv(.c) void,
-    user: ?*anyopaque,
-    lang_out: [*]u8,
-    lang_out_len: c_int,
-) c_int;
+const SegmentCb = *const fn (?*anyopaque, i64, i64, [*:0]const u8) callconv(.c) void;
+extern fn ah_transcribe(model_path: [*:0]const u8, pcm: [*]const f32, n_samples: c_int, language: ?[*:0]const u8, n_threads: c_int, cb: SegmentCb, user: ?*anyopaque, lang_out: [*]u8, lang_out_len: c_int) c_int;
+extern fn ah_whisper_open(model_path: [*:0]const u8) ?*anyopaque;
+extern fn ah_whisper_close(ctx: ?*anyopaque) void;
+extern fn ah_whisper_run(ctx: *anyopaque, pcm: [*]const f32, n_samples: c_int, language: ?[*:0]const u8, n_threads: c_int, keep_context: c_int, cb: SegmentCb, user: ?*anyopaque, lang_out: [*]u8, lang_out_len: c_int) c_int;
 
 pub const Options = struct {
     dir: []const u8,
     lang: ?[]const u8 = null,
     model: ?[]const u8 = null,
     clipboard: bool = true,
+    live: bool = false,
 };
 
+const RATE = 16000;
+/// 100 ms windows for loudness (pause detection and the silence filter).
+const WIN = RATE / 10;
+
 pub fn run(a: std.mem.Allocator, o: Options) !void {
-    const sess_path = try util.join(a, &.{ o.dir, "session.json" });
-    const bytes = util.readFile(a, sess_path) catch return error.NoSessionJson;
-    const parsed = try model.fromJson(model.Session, a, bytes);
-    const session = parsed.value;
+    if (o.live) return runLive(a, o);
+    const session = try readSession(a, o.dir);
     util.log("⧗ Processing {s}", .{o.dir});
 
     var transcript: ?model.Transcript = null;
@@ -37,9 +41,22 @@ pub fn run(a: std.mem.Allocator, o: Options) !void {
         if (findModel(a, o.model)) |model_path| {
             transcript = try transcribe(a, try util.join(a, &.{ o.dir, au.file }), au.offset_ms, model_path, o.lang);
             try util.writeFile(try util.join(a, &.{ o.dir, "transcript.json" }), try model.toJson(a, transcript.?));
-        } else util.log("  no whisper model found — put a ggml-*.bin into a 'models' folder next to the exe{s}", .{if (util.is_windows) "" else " or in ~/.local/share/annotation-helper/models"});
+        } else logNoModel();
     }
+    try finish(a, o, session, transcript);
+}
 
+fn readSession(a: std.mem.Allocator, dir: []const u8) !model.Session {
+    const bytes = util.readFile(a, try util.join(a, &.{ dir, "session.json" })) catch return error.NoSessionJson;
+    return (try model.fromJson(model.Session, a, bytes)).value;
+}
+
+fn logNoModel() void {
+    util.log("  no whisper model found — put a ggml-*.bin into a 'models' folder next to the exe{s}", .{if (util.is_windows) "" else " or in ~/.local/share/annotation-helper/models"});
+}
+
+/// Writes brief.md and puts the hand-off prompt on the clipboard.
+fn finish(a: std.mem.Allocator, o: Options, session: model.Session, transcript: ?model.Transcript) !void {
     const brief = try buildBrief(a, session, transcript);
     const brief_path = try util.join(a, &.{ o.dir, "brief.md" });
     try util.writeFile(brief_path, brief);
@@ -99,11 +116,11 @@ fn loadPcm16k(path: []const u8) ![]f32 {
     var frames: u64 = 0;
     const rc = if (comptime util.is_windows) blk: {
         var buf: [1024]u16 = undefined;
-        break :blk ah_decode_wav(util.wideInto(&buf, path), 16000, &pcm, &frames);
+        break :blk ah_decode_wav(util.wideInto(&buf, path), RATE, &pcm, &frames);
     } else blk: {
         var buf: [4096]u8 = undefined;
         const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return error.NameTooLong;
-        break :blk ah_decode_wav_utf8(z.ptr, 16000, &pcm, &frames);
+        break :blk ah_decode_wav_utf8(z.ptr, RATE, &pcm, &frames);
     };
     if (rc != 0) {
         util.log("  cannot read audio: {s}", .{std.mem.span(ah_decode_error())});
@@ -112,43 +129,32 @@ fn loadPcm16k(path: []const u8) ![]f32 {
     return pcm.?[0..@intCast(frames)];
 }
 
+const Raw = struct { t0: i64, t1: i64, text: []const u8 };
+
 const Collect = struct {
     a: std.mem.Allocator,
-    raw: std.ArrayList(struct { t0: i64, t1: i64, text: []const u8 }) = .empty,
+    raw: std.ArrayList(Raw) = .empty,
+    /// Added to whisper's chunk-relative times (live mode), in ms.
+    base_ms: i64 = 0,
 
     fn cb(user: ?*anyopaque, t0: i64, t1: i64, text: [*:0]const u8) callconv(.c) void {
         const self: *Collect = @ptrCast(@alignCast(user.?));
         const t = self.a.dupe(u8, std.mem.trim(u8, std.mem.span(text), " \t\r\n")) catch return;
-        self.raw.append(self.a, .{ .t0 = t0 * 10, .t1 = t1 * 10, .text = t }) catch {};
+        self.raw.append(self.a, .{ .t0 = t0 * 10 + self.base_ms, .t1 = t1 * 10 + self.base_ms, .text = t }) catch {};
     }
 };
 
-fn transcribe(a: std.mem.Allocator, wav_path: []const u8, offset_ms: i64, model_path: []const u8, lang: ?[]const u8) !model.Transcript {
-    const pcm = try loadPcm16k(wav_path);
-    defer ah_free(pcm.ptr);
-    const model_name = std.fs.path.basenameWindows(model_path);
-    util.log("  transcribing {d}s of audio with {s} …", .{ pcm.len / 16000, model_name });
-    const started = util.nowMs();
+fn rmsOf(pcm: []const f32) f32 {
+    if (pcm.len == 0) return 0;
+    var s: f32 = 0;
+    for (pcm) |v| s += v * v;
+    return @sqrt(s / @as(f32, @floatFromInt(pcm.len)));
+}
 
-    var col = Collect{ .a = a };
-    var lang_buf: [16]u8 = @splat(0);
-    const threads: c_int = @intCast(@min(std.Thread.getCpuCount() catch 4, 8));
-    const mz = try a.dupeSentinel(u8, model_path, 0);
-    const lz: ?[:0]u8 = if (lang) |l| try a.dupeSentinel(u8, l, 0) else null;
-    const rc = ah_transcribe(mz.ptr, pcm.ptr, @intCast(pcm.len), if (lz) |l| l.ptr else null, threads, Collect.cb, &col, &lang_buf, lang_buf.len);
-    if (rc == 1) return error.ModelLoadFailed;
-    if (rc != 0) return error.TranscriptionFailed;
-
-    // RMS per 100 ms; drop "hallucinated" segments that fall into silence.
-    const nwin = (pcm.len + 1599) / 1600;
-    const rms = try a.alloc(f32, nwin);
-    for (rms, 0..) |*r, i| {
-        const win = pcm[i * 1600 .. @min(pcm.len, (i + 1) * 1600)];
-        var s: f32 = 0;
-        for (win) |v| s += v * v;
-        r.* = @sqrt(s / @as(f32, @floatFromInt(win.len)));
-    }
-    const sorted = try a.dupe(f32, rms);
+/// Loudness above which a 100 ms window counts as speech, from the recording so far.
+fn speechGate(a: std.mem.Allocator, rms: []const f32) f32 {
+    const sorted = a.dupe(f32, rms) catch return 0;
+    defer a.free(sorted);
     std.mem.sort(f32, sorted, {}, std.sort.asc(f32));
     const pct = struct {
         fn f(v: []const f32, q: f32) f32 {
@@ -158,10 +164,15 @@ fn transcribe(a: std.mem.Allocator, wav_path: []const u8, offset_ms: i64, model_
     }.f;
     const noise = pct(sorted, 0.2);
     const speech = pct(sorted, 0.95);
-    const gate = noise + 0.12 * (speech - noise);
+    return noise + 0.12 * (speech - noise);
+}
 
+/// Drops empty, bracketed ("[music]") and "hallucinated" segments that fall into silence,
+/// and shifts the rest by `offset_ms` (session time of the first sample).
+fn filterSegments(a: std.mem.Allocator, raw: []const Raw, rms: []const f32, offset_ms: i64) ![]model.Segment {
+    const gate = speechGate(a, rms);
     var segs: std.ArrayList(model.Segment) = .empty;
-    for (col.raw.items) |s| {
+    for (raw) |s| {
         const t = s.text;
         const bracketed = t.len >= 2 and ((t[0] == '[' and t[t.len - 1] == ']') or (t[0] == '(' and t[t.len - 1] == ')') or (t[0] == '*' and t[t.len - 1] == '*'));
         const w0: usize = @intCast(@divTrunc(@max(s.t0, 0), 100));
@@ -173,9 +184,300 @@ fn transcribe(a: std.mem.Allocator, wav_path: []const u8, offset_ms: i64, model_
         if (t.len == 0 or bracketed or loudest < gate) continue;
         try segs.append(a, .{ .t_start_ms = s.t0 + offset_ms, .t_end_ms = s.t1 + offset_ms, .text = t });
     }
+    return segs.items;
+}
+
+fn threadsFull() c_int {
+    return @intCast(@min(std.Thread.getCpuCount() catch 4, 8));
+}
+
+fn transcribe(a: std.mem.Allocator, wav_path: []const u8, offset_ms: i64, model_path: []const u8, lang: ?[]const u8) !model.Transcript {
+    const pcm = try loadPcm16k(wav_path);
+    defer ah_free(pcm.ptr);
+    const model_name = std.fs.path.basenameWindows(model_path);
+    util.log("  transcribing {d}s of audio with {s} …", .{ pcm.len / RATE, model_name });
+    const started = util.nowMs();
+
+    var col = Collect{ .a = a };
+    var lang_buf: [16]u8 = @splat(0);
+    const mz = try a.dupeSentinel(u8, model_path, 0);
+    const lz: ?[:0]u8 = if (lang) |l| try a.dupeSentinel(u8, l, 0) else null;
+    const rc = ah_transcribe(mz.ptr, pcm.ptr, @intCast(pcm.len), if (lz) |l| l.ptr else null, threadsFull(), Collect.cb, &col, &lang_buf, lang_buf.len);
+    if (rc == 1) return error.ModelLoadFailed;
+    if (rc != 0) return error.TranscriptionFailed;
+
+    const rms = try a.alloc(f32, (pcm.len + WIN - 1) / WIN);
+    for (rms, 0..) |*r, i| r.* = rmsOf(pcm[i * WIN .. @min(pcm.len, (i + 1) * WIN)]);
+    const segs = try filterSegments(a, col.raw.items, rms, offset_ms);
     const language = std.mem.sliceTo(&lang_buf, 0);
-    util.log("  {d} segment(s), language {s}, took {d:.1}s", .{ segs.items.len, if (language.len > 0) language else "?", @as(f64, @floatFromInt(util.nowMs() - started)) / 1000 });
-    return .{ .model = model_name, .language = if (language.len > 0) try a.dupe(u8, language) else null, .segments = segs.items };
+    util.log("  {d} segment(s), language {s}, took {d:.1}s", .{ segs.len, if (language.len > 0) language else "?", @as(f64, @floatFromInt(util.nowMs() - started)) / 1000 });
+    return .{ .model = model_name, .language = if (language.len > 0) try a.dupe(u8, language) else null, .segments = segs };
+}
+
+// ------------------------------------------------------------------ live mode
+
+/// audio.wav while the recorder is still writing it (16 kHz mono 16-bit PCM).
+const GrowingWav = struct {
+    handle: if (util.is_windows) w.HANDLE else c_int,
+    carry: ?u8 = null,
+
+    fn open(path: []const u8) !GrowingWav {
+        // The recorder created the file before we were started; allow a moment anyway.
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            if (openRaw(path)) |g| {
+                var r = g;
+                try r.skipHeader();
+                return r;
+            } else |e| if (tries > 50) return e;
+            sleepMs(100);
+        }
+    }
+
+    fn openRaw(path: []const u8) !GrowingWav {
+        if (comptime util.is_windows) {
+            var buf: [1024]u16 = undefined;
+            const h = w.CreateFileW(util.wideInto(&buf, path), w.FILE_GENERIC_READ, .{ .READ = 1, .WRITE = 1, .DELETE = 1 }, null, w.OPEN_EXISTING, w.FILE_ATTRIBUTE_NORMAL, null);
+            if (h == w.INVALID_HANDLE_VALUE) return error.FileNotFound;
+            return .{ .handle = h };
+        }
+        var buf: [4096]u8 = undefined;
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return error.NameTooLong;
+        const fd = lsys.open(z.ptr, lsys.O_RDONLY | lsys.O_CLOEXEC);
+        if (fd < 0) return error.FileNotFound;
+        return .{ .handle = fd };
+    }
+
+    fn close(g: *GrowingWav) void {
+        if (comptime util.is_windows) _ = w.CloseHandle(g.handle) else _ = lsys.close(g.handle);
+    }
+
+    /// Bytes available right now (0 = nothing new yet).
+    fn read(g: *GrowingWav, buf: []u8) usize {
+        if (comptime util.is_windows) {
+            var n: u32 = 0;
+            if (w.ReadFile(g.handle, buf.ptr, @intCast(buf.len), &n, null) == 0) return 0;
+            return n;
+        }
+        const n = lsys.read(g.handle, buf.ptr, buf.len);
+        return if (n > 0) @intCast(n) else 0;
+    }
+
+    fn readExact(g: *GrowingWav, buf: []u8) !void {
+        var off: usize = 0;
+        var waited: u32 = 0;
+        while (off < buf.len) {
+            const n = g.read(buf[off..]);
+            if (n == 0) {
+                waited += 1;
+                if (waited > 100) return error.Truncated;
+                sleepMs(50);
+            }
+            off += n;
+        }
+    }
+
+    /// Checks the format and positions at the first sample.
+    fn skipHeader(g: *GrowingWav) !void {
+        var riff: [12]u8 = undefined;
+        try g.readExact(&riff);
+        if (!std.mem.eql(u8, riff[0..4], "RIFF") or !std.mem.eql(u8, riff[8..12], "WAVE")) return error.NotWav;
+        while (true) {
+            var ch: [8]u8 = undefined;
+            try g.readExact(&ch);
+            const size = std.mem.readInt(u32, ch[4..8], .little);
+            if (std.mem.eql(u8, ch[0..4], "data")) return;
+            if (size > 4096) return error.NotWav;
+            var body: [4096]u8 = undefined;
+            const padded = size + (size & 1);
+            try g.readExact(body[0..padded]);
+            if (std.mem.eql(u8, ch[0..4], "fmt ")) {
+                const fmt = std.mem.readInt(u16, body[0..2], .little);
+                const channels = std.mem.readInt(u16, body[2..4], .little);
+                const rate = std.mem.readInt(u32, body[4..8], .little);
+                const bits = std.mem.readInt(u16, body[14..16], .little);
+                if (fmt != 1 or channels != 1 or rate != RATE or bits != 16) return error.UnsupportedWav;
+            }
+        }
+    }
+
+    /// Appends the newly written samples (as floats) to `out`; returns how many.
+    fn poll(g: *GrowingWav, a: std.mem.Allocator, out: *std.ArrayList(f32)) !usize {
+        var buf: [32768]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            var off: usize = 0;
+            if (g.carry) |c| {
+                buf[0] = c;
+                off = 1;
+                g.carry = null;
+            }
+            const n = g.read(buf[off..]) + off;
+            if (n == off and off == 0) break;
+            const whole = n / 2 * 2;
+            if (whole < n) g.carry = buf[n - 1];
+            try out.ensureUnusedCapacity(a, whole / 2);
+            var i: usize = 0;
+            while (i < whole) : (i += 2) {
+                const v = std.mem.readInt(i16, buf[i..][0..2], .little);
+                out.appendAssumeCapacity(@as(f32, @floatFromInt(v)) / 32768.0);
+            }
+            total += whole / 2;
+            if (n < buf.len) break;
+        }
+        return total;
+    }
+};
+
+fn sleepMs(ms: u32) void {
+    if (comptime util.is_windows) w.Sleep(ms) else lsys.sleepMs(ms);
+}
+
+const Signal = enum { none, finish, cancel };
+
+/// What the app says on our stdin: closed = the session ended, "cancel" = discard it.
+fn checkStdin() Signal {
+    var buf: [64]u8 = undefined;
+    if (comptime util.is_windows) {
+        const h = util.stdHandle(w.STD_INPUT_HANDLE) orelse return .finish;
+        var avail: u32 = 0;
+        if (w.PeekNamedPipe(h, null, 0, null, &avail, null) == 0) return .finish; // broken pipe: closed
+        if (avail == 0) return .none;
+        var n: u32 = 0;
+        if (w.ReadFile(h, &buf, @intCast(@min(avail, buf.len)), &n, null) == 0) return .finish;
+        return if (std.mem.indexOf(u8, buf[0..n], "cancel") != null) .cancel else .none;
+    }
+    var p = [1]lsys.PollFd{.{ .fd = 0, .events = lsys.POLLIN }};
+    if (lsys.poll(&p, 1, 0) <= 0) return .none;
+    const n = lsys.read(0, &buf, buf.len);
+    if (n <= 0) return .finish;
+    return if (std.mem.indexOf(u8, buf[0..@intCast(n)], "cancel") != null) .cancel else .none;
+}
+
+const MIN_CHUNK = 10 * RATE;
+
+const Live = struct {
+    a: std.mem.Allocator,
+    ctx: *anyopaque,
+    col: Collect,
+    /// Samples not transcribed yet; `base` is the index of pending[0] in the recording.
+    pending: std.ArrayList(f32) = .empty,
+    base: u64 = 0,
+    /// Loudness of every complete 100 ms window of the recording.
+    rms: std.ArrayList(f32) = .empty,
+    lang: ?[:0]const u8,
+    lang_buf: [16]u8 = @splat(0),
+    chunks: u32 = 0,
+
+    fn updateRms(l: *Live) void {
+        const done_samples = l.rms.items.len * WIN;
+        const have = l.base + l.pending.items.len;
+        var start = done_samples;
+        while (start + WIN <= have) : (start += WIN) {
+            const off: usize = @intCast(start - l.base);
+            l.rms.append(l.a, rmsOf(l.pending.items[off..][0..WIN])) catch return;
+        }
+    }
+
+    /// Where to cut `pending`: in the middle of the first pause of ≥ 0.6 s after at least
+    /// 10 s of audio, or (no pause) at the quietest moment once 28 s have piled up.
+    /// whisper always encodes a 30 s window, so every call costs about the same; few,
+    /// long chunks keep up best, and the tail left at the end costs one call either way.
+    fn findCut(l: *Live) ?usize {
+        const len = l.pending.items.len;
+        if (len < MIN_CHUNK) return null;
+        const gate = speechGate(l.a, l.rms.items);
+        const first_win: usize = @intCast((l.base + WIN - 1) / WIN);
+        const last_win = l.rms.items.len;
+        var quiet: usize = 0;
+        var win = first_win + MIN_CHUNK / WIN - 6;
+        while (win < last_win) : (win += 1) {
+            if (l.rms.items[win] < gate) {
+                quiet += 1;
+                if (quiet >= 6) {
+                    const mid = win + 1 - quiet / 2;
+                    const cut = mid * WIN - l.base;
+                    if (cut >= MIN_CHUNK) return @intCast(cut);
+                }
+            } else quiet = 0;
+        }
+        if (len < 28 * RATE) return null;
+        var best = last_win - 1;
+        var w0 = if (last_win > 40) last_win - 40 else first_win;
+        while (w0 < last_win) : (w0 += 1) if (l.rms.items[w0] < l.rms.items[best]) {
+            best = w0;
+        };
+        const cut = @max(best * WIN, l.base + RATE) - l.base;
+        return @intCast(@min(cut, len));
+    }
+
+    /// Transcribes pending[0..n] and drops it.
+    fn transcribe(l: *Live, n: usize, threads: c_int) !void {
+        const chunk = l.pending.items[0..n];
+        // Skip chunks without any speech (saves time, avoids invented text).
+        const w0: usize = @intCast(l.base / WIN);
+        const w1 = @min(l.rms.items.len, @as(usize, @intCast((l.base + n) / WIN)));
+        const gate = speechGate(l.a, l.rms.items);
+        var speech = w1 <= w0; // too short to judge: transcribe
+        if (w0 < w1) for (l.rms.items[w0..w1]) |v| {
+            if (v >= gate) speech = true;
+        };
+        if (speech and n >= RATE / 2) {
+            l.col.base_ms = @intCast(l.base * 1000 / RATE);
+            const t = util.nowMs();
+            const rc = ah_whisper_run(l.ctx, chunk.ptr, @intCast(n), if (l.lang) |x| x.ptr else null, threads, 1, Collect.cb, &l.col, &l.lang_buf, l.lang_buf.len);
+            if (rc != 0) return error.TranscriptionFailed;
+            // Keep the language whisper detected for the rest of the recording.
+            if (l.lang == null and l.lang_buf[0] != 0) l.lang = l.lang_buf[0..std.mem.indexOfScalar(u8, &l.lang_buf, 0).? :0];
+            l.chunks += 1;
+            util.log("  [{d}:{d:0>2}] transcribed {d:.1}s in {d:.1}s", .{ l.base / RATE / 60, l.base / RATE % 60, @as(f64, @floatFromInt(n)) / RATE, @as(f64, @floatFromInt(util.nowMs() - t)) / 1000 });
+        }
+        l.pending.replaceRange(l.a, 0, n, &.{}) catch unreachable;
+        l.base += n;
+    }
+};
+
+fn runLive(a: std.mem.Allocator, o: Options) !void {
+    const model_path = findModel(a, o.model) orelse {
+        logNoModel();
+        return error.NoModel;
+    };
+    util.log("⧗ Live transcription for {s} with {s}", .{ o.dir, std.fs.path.basenameWindows(model_path) });
+    const ctx = ah_whisper_open((try a.dupeSentinel(u8, model_path, 0)).ptr) orelse return error.ModelLoadFailed;
+    defer ah_whisper_close(ctx);
+    var wav = try GrowingWav.open(try util.join(a, &.{ o.dir, "audio.wav" }));
+    defer wav.close();
+
+    var l = Live{ .a = a, .ctx = ctx, .col = .{ .a = a }, .lang = if (o.lang) |x| try a.dupeSentinel(u8, x, 0) else null };
+    // While recording, leave CPU for the user's work.
+    const live_threads: c_int = @intCast(std.math.clamp((std.Thread.getCpuCount() catch 4) / 2, 2, 8));
+    var signal: Signal = .none;
+    while (signal == .none) {
+        _ = try wav.poll(a, &l.pending);
+        l.updateRms();
+        signal = checkStdin();
+        if (signal != .none) break;
+        if (l.findCut()) |cut| try l.transcribe(cut, live_threads) else sleepMs(200);
+    }
+    if (signal == .cancel) {
+        util.log("  cancelled", .{});
+        return;
+    }
+    // The session ended: the recorder has finalized the file. Transcribe the rest.
+    const stopped = util.nowMs();
+    _ = try wav.poll(a, &l.pending);
+    l.updateRms();
+    while (l.findCut()) |cut| try l.transcribe(cut, threadsFull());
+    if (l.pending.items.len > 0) try l.transcribe(l.pending.items.len, threadsFull());
+    util.log("  {d} chunk(s); {d:.1}s of work left after the recording ended", .{ l.chunks, @as(f64, @floatFromInt(util.nowMs() - stopped)) / 1000 });
+
+    const session = try readSession(a, o.dir);
+    const offset = if (session.audio) |au| au.offset_ms else 0;
+    const segs = try filterSegments(a, l.col.raw.items, l.rms.items, offset);
+    const language = std.mem.sliceTo(&l.lang_buf, 0);
+    const transcript = model.Transcript{ .model = std.fs.path.basenameWindows(model_path), .language = if (language.len > 0) language else if (o.lang) |x| x else null, .segments = segs };
+    try util.writeFile(try util.join(a, &.{ o.dir, "transcript.json" }), try model.toJson(a, transcript));
+    try finish(a, o, session, transcript);
 }
 
 // ------------------------------------------------------------------ brief

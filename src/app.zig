@@ -249,7 +249,7 @@ fn sendJobWith(arena: *std.heap.ArenaAllocator, kind: worker.Kind) void {
 
 // ------------------------------------------------------------------ session
 
-fn startSession(with_audio: bool) !void {
+fn startSession(with_audio: bool, for_request: bool) !void {
     if (app.session != null) return;
     const ts = util.localTimestamp();
     const dir = try util.join(util.gpa, &.{ app.opts.out_dir, &ts.id });
@@ -264,9 +264,15 @@ fn startSession(with_audio: bool) !void {
     const arena = try worker.newArena();
     const a = arena.allocator();
     const mons = monitors();
+    // Transcribe while recording, so the brief is ready right after the session ends.
+    var live_args: ?[]const u8 = null;
+    if (active.recorder != null) if (app.opts.process_args) |pa| {
+        live_args = if (for_request) try a.print("{s} --no-clipboard", .{pa}) else try a.dupe(u8, pa);
+    };
     sendJobWith(arena, .{ .begin = .{
         .session = .{ .id = try a.dupe(u8, &ts.id), .started_local = try a.dupe(u8, &ts.human), .monitors = try a.dupe(model.Monitor, mons.items[0..mons.n]) },
         .dir = try a.dupe(u8, dir),
+        .live_args = live_args,
     } });
     app.session = active;
     updateIndicator();
@@ -310,7 +316,7 @@ fn stopSession(wait: bool, reply: ?*worker.Reply) void {
 // ------------------------------------------------------------------ drawing
 
 fn startDraw() !void {
-    try startSession(true);
+    try startSession(true, false);
     const fg = w.GetForegroundWindow();
     var warm: [2][2]i32 = undefined;
     var nwarm: usize = 0;
@@ -572,7 +578,7 @@ fn setColor(c: model.ColorName) void {
 
 fn onHotkey(id: usize) void {
     switch (id) {
-        HK_SESSION => if (app.session != null) stopSession(false, null) else startSession(true) catch |e| util.log("  error: {s}", .{@errorName(e)}),
+        HK_SESSION => if (app.session != null) stopSession(false, null) else startSession(true, false) catch |e| util.log("  error: {s}", .{@errorName(e)}),
         HK_DRAW => if (app.draw != null) finishDraw() else startDraw() catch |e| util.log("  error: {s}", .{@errorName(e)}),
         else => {},
     }
@@ -723,7 +729,7 @@ fn beginRequests() void {
             replyErr(req.reply, "the user is already recording or annotating; try again later");
             continue;
         }
-        startSession(req.voice) catch {
+        startSession(req.voice, true) catch {
             replyErr(req.reply, "could not start a session");
             continue;
         };

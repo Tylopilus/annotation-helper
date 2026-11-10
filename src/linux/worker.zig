@@ -34,7 +34,8 @@ pub const EndJob = struct {
 
 pub const Kind = union(enum) {
     warmup: []const [2]i32,
-    begin: struct { session: model.Session, dir: []const u8 },
+    /// `live_args`: start live transcription with these `process` arguments.
+    begin: struct { session: model.Session, dir: []const u8, live_args: ?[]const []const u8 = null },
     frame: FrameJob,
     end: EndJob,
     discard,
@@ -89,7 +90,26 @@ pub const Worker = struct {
     }
 };
 
+/// The `process --live` helper of the current session.
+const LiveProc = struct {
+    pid: c_int,
+    stdin: c_int,
+
+    /// Session over: the helper transcribes the rest and writes the brief. Returns its exit code.
+    fn finish(l: LiveProc) u32 {
+        _ = sys.close(l.stdin);
+        return sys.wait(l.pid);
+    }
+
+    fn cancel(l: LiveProc) void {
+        _ = sys.write(l.stdin, "cancel\n", 7);
+        _ = sys.close(l.stdin);
+        _ = sys.wait(l.pid);
+    }
+};
+
 const State = struct {
+    live: ?LiveProc = null,
     ax: ?atspi.Atspi = null,
     ax_tried: bool = false,
     wayland: bool,
@@ -151,6 +171,7 @@ fn handle(st: *State, job: *Job) void {
             st.dir = b.dir;
             util.mkdirAll(b.dir) catch {};
             st.save();
+            if (b.live_args) |args| st.live = startLive(b.dir, args);
         },
         .frame => |f| {
             st.arenas.append(util.gpa, job.arena) catch {};
@@ -171,12 +192,15 @@ fn handle(st: *State, job: *Job) void {
                 for (pa, copy) |src, *dst| dst.* = util.gpa.dupe(u8, src) catch &.{};
                 args = copy;
             }
-            const ctx = Finish{ .dir = dir, .args = args, .run_processor = e.process_args != null and st.session != null, .reply = e.reply, .notify = e.notify };
+            const ctx = Finish{ .dir = dir, .args = args, .run_processor = e.process_args != null and st.session != null, .reply = e.reply, .notify = e.notify, .live = st.live };
+            st.live = null;
             st.reset();
             freeArena(job.arena);
             if (e.wait) ctx.go() else if (std.Thread.spawn(util.thread_cfg, Finish.go, .{ctx})) |t| t.detach() else |_| ctx.go();
         },
         .discard => {
+            if (st.live) |l| l.cancel();
+            st.live = null;
             if (st.dir.len > 0) util.deleteFlatDir(util.gpa, st.dir);
             st.reset();
             freeArena(job.arena);
@@ -191,11 +215,18 @@ const Finish = struct {
     run_processor: bool,
     reply: ?*Reply,
     notify: ?*const fn (*Done) void,
+    live: ?LiveProc = null,
 
     fn go(f: Finish) void {
         var ok = true;
         var text: []u8 = f.dir;
-        if (f.run_processor) {
+        var done_live = false;
+        if (f.live) |l| {
+            const code = l.finish();
+            done_live = code == 0;
+            if (!done_live) util.log("  live transcription failed (exit code {d}); transcribing again", .{code});
+        }
+        if (f.run_processor and !done_live) {
             if (runProcessor(f.dir, f.args orelse &.{})) |err| {
                 ok = false;
                 text = err;
@@ -217,6 +248,28 @@ const Finish = struct {
         } else util.gpa.free(text);
     }
 };
+
+/// Starts `<exe> process <dir> --live <args>` with output in process.log; null on failure
+/// (the session is then transcribed when it ends).
+fn startLive(dir: []const u8, args: []const []const u8) ?LiveProc {
+    const exe = util.exePath(util.gpa) catch return null;
+    defer util.gpa.free(exe);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(util.gpa);
+    argv.appendSlice(util.gpa, &.{ exe, "process", dir, "--live" }) catch return null;
+    argv.appendSlice(util.gpa, args) catch return null;
+    const log_path = util.join(util.gpa, &.{ dir, "process.log" }) catch return null;
+    defer util.gpa.free(log_path);
+    var fds: [2]c_int = undefined;
+    if (sys.pipe2(&fds, sys.O_CLOEXEC) != 0) return null;
+    const pid = sys.spawn(util.gpa, argv.items, .{ .log_path = log_path, .stdin_fd = fds[0] }) catch {
+        _ = sys.close(fds[0]);
+        _ = sys.close(fds[1]);
+        return null;
+    };
+    _ = sys.close(fds[0]);
+    return .{ .pid = pid, .stdin = fds[1] };
+}
 
 /// Runs `<exe> process <dir> <args>` with output in process.log. Returns an error
 /// message (gpa-owned) or null on success.
